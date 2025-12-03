@@ -45,6 +45,7 @@ export interface IMASOptions {
     urlExpirationTime?: number | false;
     blobName?: MASResolverFunction<string>;
     containerName: MASResolverFunction<string> | string;
+    autoCreateContainer?: boolean;
     metadata?: MASResolverFunction<MASMetadata> | MASMetadata;
     contentSettings?: MASResolverFunction<MASContentSettings> | MASContentSettings;
     containerAccessLevel?: MASContainerAccessLevel;
@@ -82,6 +83,7 @@ export class MulterAzureStorage implements StorageEngine {
     private _contentSettings: MASResolverFunction<MASContentSettings> | null;
     private _containerName: MASResolverFunction<string>;
     private _containerAccessLevel: MASContainerAccessLevel;
+    private _autoCreateContainer: boolean;
 
     constructor(options: IMASOptions) {
         // Connection credentials are required
@@ -119,6 +121,8 @@ export class MulterAzureStorage implements StorageEngine {
         } else {
             this._urlExpirationTime = options.urlExpirationTime;
         }
+        // Check for auto container creation
+        this._autoCreateContainer = options.autoCreateContainer ?? true;
         // Init blob service
         if (typeof connection === 'string') {
             this._blobServiceClient = BlobServiceClient.fromConnectionString(connection);
@@ -151,7 +155,9 @@ export class MulterAzureStorage implements StorageEngine {
         // Create the container if it doesn't exist
         const containerClient = this._blobServiceClient.getContainerClient(containerName);
         const publicAccessLevel = this._containerAccessLevel === MASContainerAccessLevel.Private ? undefined : this._containerAccessLevel;
-        await containerClient.createIfNotExists({ access: publicAccessLevel });
+        if (this._autoCreateContainer) {
+            await containerClient.createIfNotExists({ access: publicAccessLevel });
+        }
         // Upload the file stream
         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
         await blockBlobClient.uploadStream(file.stream, undefined, undefined, {
