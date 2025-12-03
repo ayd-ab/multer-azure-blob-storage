@@ -1,414 +1,198 @@
 // *********************************************************
 //
-// This file is subject to the terms and conditions defined in
+// This file is subject to the terms and conditions defined in the
 // file 'LICENSE.txt', which is part of this source code package.
 //
 // *********************************************************
 
 // Node Modules
+import { extname } from "node:path";
 import { v4 } from "uuid";
-import { extname } from "path";
 import { Request } from "express";
 import { StorageEngine } from "multer";
-import { Writable } from "stream";
-import { BlobService, date, BlobUtilities } from "azure-storage";
+import { BlobSASPermissions, BlobServiceClient, StorageSharedKeyCredential } from '@azure/storage-blob';
 
 // Custom types
-export type MetadataObj = { [k: string]: string };
-export type MASNameResolver = (req: Request, file: Express.Multer.File) => Promise<string>;
-export type MASObjectResolver = (req: Request, file: Express.Multer.File) => Promise<Object>;
+export interface MASContentSettings {
+    cacheControl?: string;
+    /** Optional. Sets the blob's content type. If specified, this property is stored with the blob and returned with a read request. */
+    contentType?: string;
+    /** Optional. An MD5 hash of the blob content. Note that this hash is not validated, as the hashes for the individual blocks were validated when each was uploaded. */
+    contentMD5?: Uint8Array;
+    /** Optional. Sets the blob's content encoding. If specified, this property is stored with the blob and returned with a read request. */
+    contentEncoding?: string;
+    /** Optional. Set the blob's content language. If specified, this property is stored with the blob and returned with a read request. */
+    contentLanguage?: string;
+    /** Optional. Sets the blob's Content-Disposition header. */
+    contentDisposition?: string;
+}
+
+export type MASMetadata = { [k: string]: string };
+
+export type MASResolverFunction<T> = (req: Request, file: Express.Multer.File) => Promise<T>;
+
+export enum MASContainerAccessLevel {
+    PublicContainer = 'container',
+    PublicBlob = 'blob',
+    Private = 'private'
+}
 
 // Custom interfaces
 export interface IMASOptions {
     accessKey?: string;
     accountName?: string;
     connectionString?: string;
-    urlExpirationTime?: number;
-    blobName?: MASNameResolver;
-    containerName: MASNameResolver | string;
-    metadata?: MASObjectResolver | MetadataObj;
-    contentSettings?: MASObjectResolver | MetadataObj;
-    containerAccessLevel?: string;
+    urlExpirationTime?: number | false;
+    blobName?: MASResolverFunction<string>;
+    containerName: MASResolverFunction<string> | string;
+    metadata?: MASResolverFunction<MASMetadata> | MASMetadata;
+    contentSettings?: MASResolverFunction<MASContentSettings> | MASContentSettings;
+    containerAccessLevel?: MASContainerAccessLevel;
 }
 
 export interface MulterOutFile extends Express.Multer.File {
     url: string;
-    etag: string;
-    metadata: any;
+    etag?: string;
+    metadata?: any;
+    containerName: string;
     blobName: string;
-    blobType: string;
-    blobSize: string;
-    container: string;
+    blobType?: string;
+    blobSize?: string;
 }
 
-// Custom error class
-export class MASError implements Error {
-    name: string;
-    message: string;
-    errorList: any[];
+const DEFAULT_CONTAINER_ACCESS_LEVEL = MASContainerAccessLevel.Private;
+const DEFAULT_URL_EXPIRATION_TIME: number = 60; // Minutes
 
-    constructor(message?: string) {
-        this.errorList = [];
-        this.name = "Multer Azure Error";
-        this.message = message ? message : null;
-    }
-}
+const promisifyValue = <T>(value: T): MASResolverFunction<T> => () => Promise.resolve(value);
+
+const promisifyOption = <T>(value: T | MASResolverFunction<T>): MASResolverFunction<T> =>
+  typeof value === 'function' ? (value as unknown as MASResolverFunction<T>) : promisifyValue(value);
+
+const generateBlobName = (_req: Request, file: Express.Multer.File): Promise<string> => {
+    return new Promise<string>((resolve, _reject) => {
+        resolve(`${Date.now()}-${v4()}${extname(file.originalname)}`);
+    });
+};
 
 export class MulterAzureStorage implements StorageEngine {
-    private readonly DEFAULT_URL_EXPIRATION_TIME: number = 60; // Minutes
-    private readonly DEFAULT_UPLOAD_CONTAINER: string = "default-container";
-    private readonly DEFAULT_CONTAINER_ACCESS_LEVEL: string = /* aka private */ BlobUtilities.BlobContainerPublicAccessType.OFF;
-
-    private _error: MASError;
-    private _blobService: BlobService;
-    private _blobName: MASNameResolver;
+    private _blobServiceClient: BlobServiceClient;
+    private _blobName: MASResolverFunction<string>;
     private _urlExpirationTime: number | null;
-    private _metadata: MASObjectResolver;
-    private _contentSettings: MASObjectResolver;
-    private _containerName: MASNameResolver;
-    private _containerAccessLevel: string;
+    private _metadata: MASResolverFunction<MASMetadata> | null;
+    private _contentSettings: MASResolverFunction<MASContentSettings> | null;
+    private _containerName: MASResolverFunction<string>;
+    private _containerAccessLevel: MASContainerAccessLevel;
 
     constructor(options: IMASOptions) {
-        // Init error array
-        let errorLength: number = 0;
-        this._error = new MASError();
-        // Connection is preferred.
-        options.connectionString = (options.connectionString || process.env.AZURE_STORAGE_CONNECTION_STRING || null);
-        if (!options.connectionString) {
-            options.accessKey = (options.accessKey || process.env.AZURE_STORAGE_ACCESS_KEY || null);
-            options.accountName = (options.accountName || process.env.AZURE_STORAGE_ACCOUNT || null);
-            // Access key is required if no connection string is provided
-            if (!options.accessKey) {
-                errorLength++;
-                this._error.errorList.push(new Error("Missing required parameter: Azure blob storage access key."));
-            }
-            // Account name is required if no connection string is provided
-            if (!options.accountName) {
-                errorLength++;
-                this._error.errorList.push(new Error("Missing required parameter: Azure blob storage account name."));
-            }
+        // Connection credentials are required
+        const connectionString = options.connectionString || process.env.AZURE_STORAGE_CONNECTION_STRING || null;
+        const accessKey = options.accessKey || process.env.AZURE_STORAGE_ACCESS_KEY || null;
+        const accountName = options.accountName || process.env.AZURE_STORAGE_ACCOUNT || null;
+
+        let connection: string | { accountName: string, accessKey: string } | null = null;
+        if (connectionString) {
+            connection = connectionString;
+        } else if (accessKey && accountName) {
+            connection = { accountName, accessKey };
         }
-        // Container name is required
+        if (connection == null) {
+            throw new Error("Missing required parameter: Either the connection string or account name and access key must be provided.");
+        }
         if (!options.containerName) {
-            errorLength++;
-            this._error.errorList.push(new Error("Missing required parameter: Azure container name."));
+            throw new Error("Missing required parameter: Azure container name.");
         }
-        // Vaidate errors before proceeding
-        if (errorLength > 0) {
-            const inflection: string[] = errorLength > 1 ? ["are", "s"] : ["is", ""];
-            this._error.message = `There ${inflection[0]} ${errorLength} missing required parameter${inflection[1]}.`;
-            throw this._error;
-        }
-        // Set proper container name
-        switch (typeof options.containerName) {
-            case "string":
-                this._containerName = this._promisifyStaticValue(<string>options.containerName);
-                break;
-
-            case "function":
-                this._containerName = <MASNameResolver>options.containerName;
-                break;
-
-            default:
-                // Catch for if container name is provided but not a desired type    
-                this._containerName = this._promisifyStaticValue(this.DEFAULT_UPLOAD_CONTAINER);
-                break;
-        }
-        // Set container access level
-        switch (options.containerAccessLevel) {
-            case BlobUtilities.BlobContainerPublicAccessType.CONTAINER:
-                this._containerAccessLevel = BlobUtilities.BlobContainerPublicAccessType.CONTAINER;
-                break;
-
-            case BlobUtilities.BlobContainerPublicAccessType.OFF:
-                // For private, unsetting the container access level will
-                // ensure that _createContainerIfNotExists doesn't set one
-                // which results in a private container.
-                this._containerAccessLevel = BlobUtilities.BlobContainerPublicAccessType.OFF;
-                break;
-
-            case BlobUtilities.BlobContainerPublicAccessType.BLOB:
-                this._containerAccessLevel = BlobUtilities.BlobContainerPublicAccessType.BLOB;
-                break;
-
-            default:
-                // Fallback to the default container level
-                this._containerAccessLevel = this.DEFAULT_CONTAINER_ACCESS_LEVEL;
-                break;
-
-        }
+        // Set the proper container name
+        this._containerName = promisifyOption(options.containerName);
+        // Set container access level - Private by default
+        this._containerAccessLevel = options.containerAccessLevel ?? DEFAULT_CONTAINER_ACCESS_LEVEL;
         // Check for metadata
-        if (!options.metadata) {
-            this._metadata = null;
-        } else {
-            switch (typeof options.metadata) {
-                case "object":
-                    this._metadata = this._promisifyStaticObj(<MetadataObj>options.metadata);
-                    break;
-
-                case "function":
-                    this._metadata = <MASObjectResolver>options.metadata;
-                    break;
-
-                default:
-                    // Nullify all other types
-                    this._metadata = null;
-                    break;
-            }
-        }
-        // Check for user defined properties
-        if (!options.contentSettings) {
-            this._contentSettings = null;
-        } else {
-            switch (typeof options.contentSettings) {
-                case "object":
-                    this._contentSettings = this._promisifyStaticObj(<MetadataObj>options.contentSettings);
-                    break;
-
-                case "function":
-                    this._contentSettings = <MASObjectResolver>options.contentSettings;
-                    break;
-
-                default:
-                    // Nullify all other types
-                    this._contentSettings = null;
-                    break;
-            }
-        }
-        // Set proper blob name
-        this._blobName = options.blobName ? options.blobName : this._generateBlobName;
+        this._metadata = options.metadata ? promisifyOption(options.metadata) : null;
+        // Check for content settings
+        this._contentSettings = options.contentSettings ? promisifyOption(options.contentSettings) : null;
+        // Set the proper blob name
+        this._blobName = options.blobName ? options.blobName : generateBlobName;
         // Set url expiration time
-        this._urlExpirationTime = (options?.urlExpirationTime === -1)
-            ? null
-            : (options.urlExpirationTime && (typeof options.urlExpirationTime === "number") && (options.urlExpirationTime > 0))
-                ? +options.urlExpirationTime
-                : this.DEFAULT_URL_EXPIRATION_TIME;
+        if (options.urlExpirationTime === false) {
+            this._urlExpirationTime = null;
+        } else if (options.urlExpirationTime == null || options.urlExpirationTime <= 0) {
+            this._urlExpirationTime = DEFAULT_URL_EXPIRATION_TIME;
+        } else {
+            this._urlExpirationTime = options.urlExpirationTime;
+        }
         // Init blob service
-        this._blobService = options.connectionString ?
-            new BlobService(options.connectionString) :
-            new BlobService(options.accountName, options.accessKey);
-    }
-
-    async _handleFile(req: Request, file: Express.Multer.File, cb: (error?: any, info?: Partial<MulterOutFile>) => void) {
-        // Ensure we have no errors during setup
-        if (this._error.errorList.length > 0) {
-            cb(this._error);
+        if (typeof connection === 'string') {
+            this._blobServiceClient = BlobServiceClient.fromConnectionString(connection);
         } else {
-            // All good. Continue...
-        }
-        // Begin handling file
-        try {
-            // Resolve blob name and container name
-            const blobName: string = await this._blobName(req, file);
-            const containerName: string = await this._containerName(req, file);
-            // Create container if it doesnt exist
-            await this._createContainerIfNotExists(containerName, this._containerAccessLevel);
-            // Prep stream
-            let blobStream: Writable;
-            let contentSettings: MetadataObj;
-            if (this._contentSettings == null) {
-                contentSettings = {
-                    contentType: file.mimetype,
-                    contentDisposition: 'inline'
-                };
-            } else {
-                contentSettings = <MetadataObj>await this._contentSettings(req, file);
-            }
-            if (this._metadata == null) {
-                blobStream = this._blobService.createWriteStreamToBlockBlob(containerName, blobName,
-                    {
-                        contentSettings
-                    },
-                    (cWSTBBError, _result, _response) => {
-                        if (cWSTBBError) {
-                            cb(cWSTBBError);
-                        } else {
-                            // All good. Continue...
-                        }
-                    });
-            } else {
-                const metadata: MetadataObj = <MetadataObj>await this._metadata(req, file);
-                blobStream = this._blobService.createWriteStreamToBlockBlob(
-                    containerName,
-                    blobName,
-                    {
-                        contentSettings,
-                        metadata,
-                    },
-                    (cWSTBBError, _result, _response) => {
-                        if (cWSTBBError) {
-                            cb(cWSTBBError);
-                        } else {
-                            // All good. Continue...
-                        }
-                    });
-            }
-            // Upload away
-            file.stream.pipe(blobStream);
-            // Listen for changes
-            blobStream.on("close", async () => {
-                const url: string = this._getUrl(containerName, blobName);
-                const blobProperties: BlobService.BlobResult = await this._getBlobProperties(containerName, blobName);
-                const intermediateFile: Partial<MulterOutFile> = {
-                    url: url,
-                    blobName: blobName,
-                    etag: blobProperties.etag,
-                    blobType: blobProperties.blobType,
-                    metadata: blobProperties.metadata,
-                    container: blobProperties.container,
-                    blobSize: blobProperties.contentLength
-                };
-                const finalFile: Partial<MulterOutFile> = Object.assign({}, file, intermediateFile);
-                cb(null, finalFile);
-            });
-            blobStream.on("error", (bSError) => {
-                cb(bSError);
-            });
-        } catch (hFError) {
-            cb(hFError);
+            const credentials = new StorageSharedKeyCredential(connection.accountName, connection.accessKey);
+            this._blobServiceClient = new BlobServiceClient(`https://${options.accountName}.blob.core.windows.net`, credentials);
         }
     }
 
-    async _removeFile(req: Request, file: MulterOutFile, cb: (error: Error) => void) {
-        // Ensure we have no errors during setup
-        if (this._error.errorList.length > 0) {
-            cb(this._error);
-        } else {
-            // All good. Continue...
-        }
-        // Begin File removal
-        try {
-            const containerName: string = await this._containerName(req, file);
-            const result: BlobService.ContainerResult = await this._doesContainerExists(containerName);
-            if (!result.exists) {
-                this._error.message = "Cannot use container. Check if provided options are correct.";
-                cb(this._error);
-            } else {
-                await this._deleteBlobIfExists(containerName, file.blobName);
-                cb(null);
-            }
-        } catch (rFError) {
-            cb(rFError);
-        }
+    _handleFile(req: Request, file: Express.Multer.File, cb: (error?: any, info?: Partial<Express.Multer.File>) => void) {
+        this._handleFileAsync(req, file).then(file => cb(null, file)).catch(err => cb(err));
+    }
+
+    _removeFile(req: Request, file: Express.Multer.File, cb: (error: Error | null) => void) {
+        this._removeFileAsync(req, file).then(() => cb(null)).catch(err => cb(err));
     }
 
 
     /** Helpers */
 
-    private _doesContainerExists(containerName: string): Promise<BlobService.ContainerResult> {
-        return new Promise<BlobService.ContainerResult>((resolve, reject) => {
-            this._blobService.doesContainerExist(
-                containerName,
-                (error, result, _response) => {
-                    if (error) {
-                        reject(error);
-                    } else {
-                        resolve(result);
-                    }
-                });
-        });
-    }
-
-    private _createContainerIfNotExists(name: string, accessLevel?: string): Promise<void> {
-        return new Promise<void>((resolve, reject) => {
-            // if no access level is set, it defaults to private
-            if (accessLevel) {
-                this._blobService.createContainerIfNotExists(
-                    name,
-                    { publicAccessLevel: accessLevel },
-                    (error, _result, _response) => {
-                        if (error) {
-                            reject(error);
-                        } else {
-                            resolve();
-                        }
-                    });
-            } else {
-                this._blobService.createContainerIfNotExists(
-                    name,
-                    (error, _result, _response) => {
-                        if (error) {
-                            reject(error);
-                        } else {
-                            resolve();
-                        }
-                    });
+    private async _handleFileAsync(req: Request, file: Express.Multer.File): Promise<MulterOutFile> {
+        // Resolve blob name and container name
+        const containerName: string = await this._containerName(req, file);
+        const blobName: string = await this._blobName(req, file);
+        const contentSettings = this._contentSettings ? await this._contentSettings(req, file) : {
+            contentType: file.mimetype,
+            contentDisposition: 'inline'
+        };
+        const metadata = this._metadata && await this._metadata(req, file);
+        // Create the container if it doesn't exist
+        const containerClient = this._blobServiceClient.getContainerClient(containerName);
+        const publicAccessLevel = this._containerAccessLevel === MASContainerAccessLevel.Private ? undefined : this._containerAccessLevel;
+        await containerClient.createIfNotExists({ access: publicAccessLevel });
+        // Upload the file stream
+        const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+        await blockBlobClient.uploadStream(file.stream, undefined, undefined, {
+            metadata: metadata || undefined,
+            blobHTTPHeaders: {
+                blobCacheControl: contentSettings?.cacheControl,
+                blobContentType: contentSettings?.contentType,
+                blobContentMD5: contentSettings?.contentMD5,
+                blobContentEncoding: contentSettings?.contentEncoding,
+                blobContentLanguage: contentSettings.contentLanguage,
+                blobContentDisposition: contentSettings.contentDisposition,
             }
         });
-
-    }
-
-    private _getSasToken(
-        containerName: string,
-        blobName: string,
-        expiration: number | null
-    ): string {
-        return this._blobService.generateSharedAccessSignature(
-            containerName,
-            blobName,
-            {
-                AccessPolicy: {
-                    Expiry: (expiration == null) ? undefined : date.minutesFromNow(expiration),
-                    Permissions: BlobUtilities.SharedAccessPermissions.READ
-                }
-            });
-    }
-
-    private _getUrl(containerName: string, blobName: string, expiration: number | null = this._urlExpirationTime): string {
-        const sasToken = this._getSasToken(containerName, blobName, expiration);
-        return this._blobService.getUrl(containerName, blobName, sasToken);
-    }
-
-    private _getBlobProperties(containerName: string, blobName: string): Promise<BlobService.BlobResult> {
-        return new Promise<BlobService.BlobResult>((resolve, reject) => {
-            this._blobService.getBlobProperties(
-                containerName,
-                blobName,
-                (error, result, _response) => {
-                    if (error) {
-                        reject(error);
-                    } else {
-                        resolve(result);
-                    }
-                });
+        // Create the output file
+        const blobProperties = await blockBlobClient.getProperties();
+        const sasUrl = await blockBlobClient.generateSasUrl({
+            expiresOn: this._urlExpirationTime ? new Date(Date.now() + this._urlExpirationTime * 60 * 1000) : undefined,
+            permissions:  BlobSASPermissions.from({ read: true }),
         });
-    }
-
-    private _deleteBlobIfExists(containerName: string, blobName: string): Promise<void> {
-        return new Promise<void>((resolve, reject) => {
-            this._blobService.deleteBlobIfExists(
-                containerName,
-                blobName,
-                (error, _result, _response) => {
-                    if (error) {
-                        reject(error);
-                    } else {
-                        resolve();
-                    }
-                });
-        });
-    }
-
-    private _generateBlobName(_req: Request, file: Express.Multer.File): Promise<string> {
-        return new Promise<string>((resolve, _reject) => {
-            resolve(`${Date.now()}-${v4()}${extname(file.originalname)}`);
-        });
-    }
-
-    private _promisifyStaticValue(value: string): MASNameResolver {
-        return (_req: Request, _file: Express.Multer.File): Promise<string> => {
-            return new Promise<string>((resolve, _reject) => {
-                resolve(value);
-            });
+        return {
+            ...file,
+            url: sasUrl,
+            etag: blobProperties.etag,
+            metadata: blobProperties.metadata,
+            containerName: containerName,
+            blobName: blobName,
+            blobType: blobProperties.blobType,
+            blobSize: blobProperties.contentLength?.toString(),
         };
     }
 
-    private _promisifyStaticObj<T>(value: T): MASObjectResolver {
-        return (_req: Request, _file: Express.Multer.File): Promise<T> => {
-            return new Promise<T>((resolve, _reject) => {
-                resolve(value);
-            });
-        };
+    private async _removeFileAsync(req: Request, file: Express.Multer.File) {
+        const containerName: string = await this._containerName(req, file);
+        const containerClient = this._blobServiceClient.getContainerClient(containerName);
+        const containerExists = await containerClient.exists();
+        if (!containerExists) {
+            throw new Error(`Container ${containerName} does not exist.`);
+        }
+        const blobName: string = await this._blobName(req, file);
+        const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+        await blockBlobClient.deleteIfExists();
     }
 }
 

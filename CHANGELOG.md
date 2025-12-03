@@ -22,3 +22,9 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 - Dependency updates
 - Remove pinning of dependency versions in favor of semantic versioning
+
+# 2.0.0
+
+- Improved typings
+- Multer & Express now as peer dependencies
+- Rewrite based on the new @azure/storage-blob package
