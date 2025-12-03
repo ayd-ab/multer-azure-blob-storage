@@ -57,7 +57,7 @@ export interface MulterOutFile extends Express.Multer.File {
     containerName: string;
     blobName: string;
     blobType?: string;
-    blobSize?: string;
+    blobSize?: number;
 }
 
 const DEFAULT_CONTAINER_ACCESS_LEVEL = MASContainerAccessLevel.Private;
@@ -179,7 +179,7 @@ export class MulterAzureStorage implements StorageEngine {
             containerName: containerName,
             blobName: blobName,
             blobType: blobProperties.blobType,
-            blobSize: blobProperties.contentLength?.toString(),
+            blobSize: blobProperties.contentLength,
         };
     }
 
