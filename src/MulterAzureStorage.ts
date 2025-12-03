@@ -152,13 +152,7 @@ export class MulterAzureStorage implements StorageEngine {
             contentDisposition: 'inline'
         };
         const metadata = this._metadata && await this._metadata(req, file);
-        // Create the container if it doesn't exist
-        const containerClient = this._blobServiceClient.getContainerClient(containerName);
-        const publicAccessLevel = this._containerAccessLevel === MASContainerAccessLevel.Private ? undefined : this._containerAccessLevel;
-        if (this._autoCreateContainer) {
-            await containerClient.createIfNotExists({ access: publicAccessLevel });
-        }
-        // Upload the file stream
+        const containerClient = await this._getContainerClient(containerName);
         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
         await blockBlobClient.uploadStream(file.stream, undefined, undefined, {
             metadata: metadata || undefined,
@@ -191,14 +185,19 @@ export class MulterAzureStorage implements StorageEngine {
 
     private async _removeFileAsync(req: Request, file: Express.Multer.File) {
         const containerName: string = await this._containerName(req, file);
-        const containerClient = this._blobServiceClient.getContainerClient(containerName);
-        const containerExists = await containerClient.exists();
-        if (!containerExists) {
-            throw new Error(`Container ${containerName} does not exist.`);
-        }
         const blobName: string = await this._blobName(req, file);
+        const containerClient = await this._getContainerClient(containerName);
         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
         await blockBlobClient.deleteIfExists();
+    }
+
+    private async _getContainerClient(containerName: string) {
+        const containerClient = this._blobServiceClient.getContainerClient(containerName);
+        if (this._autoCreateContainer) {
+            const publicAccessLevel = this._containerAccessLevel === MASContainerAccessLevel.Private ? undefined : this._containerAccessLevel;
+            await containerClient.createIfNotExists({ access: publicAccessLevel });
+        }
+        return containerClient;
     }
 }
 
