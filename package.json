@@ -19,7 +19,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ayd-ab/multer-azure-blob-storage"
+    "url": "git+https://github.com/ayd-ab/multer-azure-blob-storage.git"
   },
   "keywords": [
     "multer",
