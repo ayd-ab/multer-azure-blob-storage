@@ -28,3 +28,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - Improved typings
 - Multer & Express now as peer dependencies
 - Rewrite based on the new @azure/storage-blob package
+
+# 2.2.2
+
+- Dropped `uuid` dependency

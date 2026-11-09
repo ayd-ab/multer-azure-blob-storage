@@ -7,7 +7,7 @@
 
 // Node Modules
 import { extname } from "node:path";
-import { v4 } from "uuid";
+import crypto from "node:crypto";
 import { Request } from "express";
 import { StorageEngine } from "multer";
 import { BlobSASPermissions, BlobServiceClient, StorageSharedKeyCredential } from '@azure/storage-blob';
@@ -71,7 +71,7 @@ const promisifyOption = <T>(value: T | MASResolverFunction<T>): MASResolverFunct
 
 const generateBlobName = (_req: Request, file: Express.Multer.File): Promise<string> => {
     return new Promise<string>((resolve, _reject) => {
-        resolve(`${Date.now()}-${v4()}${extname(file.originalname)}`);
+        resolve(`${Date.now()}-${crypto.randomUUID()}${extname(file.originalname)}`);
     });
 };
 
